@@ -2,14 +2,15 @@
 
 Endpoints
 ---------
-POST   /api/analyze                    analyze a rule set (optionally persist)
-GET    /api/analyses                   list saved analysis versions
-GET    /api/analyses/{id}              fetch one version with the full result
-GET    /api/analyses/{id}/rules        query rules (filters: status/action/ip_version)
-GET    /api/analyses/{id}/findings     query findings (filters: severity/behavioral_only)
-GET    /api/analyses/{id}/export.json  download the result as a JSON file
-GET    /api/analyses/{id}/diff/{oid}   effective-action semantic diff of two versions
-GET    /health                         liveness probe
+POST   /api/analyze                          analyze a rule set (optionally persist)
+GET    /api/analyses                         list saved analysis versions
+GET    /api/analyses/{id}                    fetch one version with the full result
+POST   /api/analyses/{id}/simulate           trial-run add/replace/remove rule changes
+GET    /api/analyses/{id}/rules              query rules (filters: status/action/ip_version)
+GET    /api/analyses/{id}/findings           query findings (filters: severity/behavioral_only)
+GET    /api/analyses/{id}/export.json        download the result as a JSON file
+GET    /api/analyses/{id}/diff/{oid}         effective-action semantic diff of two versions
+GET    /health                               liveness probe
 """
 
 from __future__ import annotations
@@ -26,7 +27,8 @@ from . import __version__
 from .analyzer import ANALYZER_VERSION, ValidationError, analyze_rules
 from . import db
 from .diff import ANALYSIS_ID_RE, diff_analyses
-from .schemas import AnalyzeRequest
+from .schemas import AnalyzeRequest, SimulateRequest
+from .simulate import SimulationPatchError, apply_patch
 
 
 @asynccontextmanager
@@ -51,6 +53,18 @@ app = FastAPI(
 @app.exception_handler(ValidationError)
 async def _validation_error_handler(_request, exc: ValidationError):
     return JSONResponse(status_code=400, content={"error": "invalid_ruleset", "detail": str(exc)})
+
+
+@app.exception_handler(SimulationPatchError)
+async def _simulation_patch_error_handler(_request, exc: SimulationPatchError):
+    return JSONResponse(
+        status_code=400,
+        content={
+            "error": "invalid_simulation_patch",
+            "detail": "illegal rule change batch; no changes were applied",
+            "errors": exc.errors,
+        },
+    )
 
 
 def _make_id(ruleset_hash: str) -> str:
@@ -112,6 +126,60 @@ def get_analysis(analysis_id: str) -> dict[str, Any]:
     if result is None:
         raise HTTPException(status_code=404, detail=f"analysis '{analysis_id}' not found")
     return result
+
+
+@app.post("/api/analyses/{analysis_id}/simulate", status_code=200)
+def simulate_changes(analysis_id: str, req: SimulateRequest) -> dict[str, Any]:
+    """Trial-run add/replace/remove rule changes against a saved version.
+
+    The saved version's input is rebuilt from its result, the batch is
+    validated as a whole (any illegal operation rejects everything), and the
+    patched rule set is re-analyzed by the regular LPM engine.  The response
+    carries the unsimulated full result plus the effective-action semantic
+    diff against the base version; nothing is written to the database.
+    """
+    if not ANALYSIS_ID_RE.match(analysis_id):
+        raise HTTPException(
+            status_code=400,
+            detail=f"invalid analysis id format: {analysis_id!r}; "
+            "expected 'an_' followed by 16 lowercase hexadecimal characters",
+        )
+
+    base = db.get_analysis(analysis_id)
+    if base is None:
+        raise HTTPException(status_code=404, detail=f"analysis '{analysis_id}' not found")
+
+    add_rules = [r.model_dump() for r in req.add]
+    replace_rules = [r.model_dump() for r in req.replace]
+    patched = apply_patch(
+        base_result=base,
+        add=add_rules,
+        replace=replace_rules,
+        remove=req.remove,
+    )
+    # Invalid CIDRs/actions inside otherwise well-addressed ops, or a patch
+    # that empties the ruleset, surface as the standard invalid_ruleset 400.
+    simulated = analyze_rules(patched)
+    simulated["persisted"] = False
+
+    # Reuse the saved-version semantic diff; the trial result has no id.
+    semantic_diff = diff_analyses(base, simulated)
+
+    return {
+        "base": {
+            "id": base.get("id"),
+            "name": base.get("name"),
+            "ruleset_hash": base.get("ruleset_hash"),
+            "analyzer_version": base.get("analyzer_version"),
+        },
+        "operations": {
+            "add": [r["rule_id"] for r in add_rules],
+            "replace": [r["rule_id"] for r in replace_rules],
+            "remove": list(req.remove),
+        },
+        "simulated": simulated,
+        "diff": semantic_diff,
+    }
 
 
 @app.get("/api/analyses/{analysis_id}/rules")

@@ -95,6 +95,7 @@ N 的实际覆盖碎片。
 | POST | `/api/analyze` | 分析规则集（默认保存；`save:false` 只算不存） |
 | GET | `/api/analyses` | 列出已保存版本（`limit`/`offset` 分页） |
 | GET | `/api/analyses/{id}` | 取某个版本的完整分析结果 |
+| POST | `/api/analyses/{id}/simulate` | 对已保存版本预演 add/replace/remove 规则变更（**不落库**，含与基准版本的语义差异） |
 | GET | `/api/analyses/{id}/rules` | 查询规则：`status=active/partial/shadowed`、`action=permit/deny`、`ip=4/6` |
 | GET | `/api/analyses/{id}/findings` | 查询发现：`severity=conflict/warning/info`、`behavioral_only=true` |
 | GET | `/api/analyses/{id}/export.json` | 以附件形式导出完整结果 JSON |
@@ -222,10 +223,101 @@ curl -s "http://localhost:8080/api/analyses/an_8914e028acea3413/diff/an_efdb05ad
 - ID 格式非法（不是 `an_` + 16 个小写十六进制字符）或两个 ID 相同 → `400`；
 - 任一版本不存在 → `404`（先做格式/同一性校验，再查存在性）。
 
+### 规则变更预演（simulate）
+
+在**不创建任何分析记录**的前提下，对某个已保存版本（基准版本）试跑一批按 `rule_id`
+定位的规则改动，并返回**重新执行 LPM 分析**的完整预演结果，以及与基准版本之间的
+[最终生效动作语义差异](#版本语义差异semantic-diff)。
+
+- `add`：新增规则，`rule_id` 必须是基准版本中不存在的**新 ID**；新规则按请求顺序
+  追加在规则列表末尾（同 CIDR 优先级裁决因此保持确定性）；
+- `replace`：**整条替换**（不是字段合并），`rule_id` 必须命中基准版本；替换后保留原
+  列表位置；不能借 replace 改 ID；
+- `remove`：按 `rule_id` 删除，必须命中基准版本；
+- **每个 `rule_id` 在整批中最多出现一次**（不能同时 replace 和 remove 同一目标，
+  也不能在同一操作里重复）；
+- **任一操作非法则整批拒绝**（`400 invalid_simulation_patch`，`errors` 数组给出
+  全部原因），不会部分生效。
+
+补丁后的规则集会**重新走一遍完整 LPM 分析**，因此删除或改写子网规则后，**祖先规则
+会在重新暴露的范围上自动恢复生效**，该范围精确体现在 `diff.changes` 中（例如删除一条
+deny 的 /16 子网规则后，其外层 permit /8 在整个 /16 上恢复，差异为
+`deny_to_permit` 覆盖完整 /16；把 deny /24 改写为 deny /25 时，另一个 /25 恢复为
+祖先的 permit）。
+
+预演结果不会出现在 `GET /api/analyses` 中；反复调用无副作用。三个操作都可省略；
+空补丁是合法请求，等价于对基准版本的重新预览（`diff.changes` 为空）。
+
+```bash
+curl -s -X POST http://localhost:8080/api/analyses/an_e38b58f57faf2325/simulate \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "add": [
+      {"rule_id": "lab-trial", "cidr": "10.10.99.0/24", "action": "deny", "source_tag": "trial"}
+    ],
+    "replace": [
+      {"rule_id": "r2", "cidr": "10.10.0.0/16", "action": "permit", "priority": 500, "source_tag": "dc1"}
+    ],
+    "remove": ["r3"]
+  }'
+```
+
+响应（节选）：
+
+```json
+{
+  "base": {
+    "id": "an_e38b58f57faf2325",
+    "name": "dc-2026-09",
+    "ruleset_hash": "e38b58f5...",
+    "analyzer_version": "1.0.0"
+  },
+  "operations": {
+    "add": ["lab-trial"],
+    "replace": ["r2"],
+    "remove": ["r3"]
+  },
+  "simulated": {
+    "analyzer_version": "1.0.0",
+    "ruleset_hash": "9f1c...",
+    "persisted": false,
+    "summary": { "rule_count": 4, "...": "..." },
+    "rules": [ "...完整规则结果，结构同 /api/analyze..." ],
+    "findings": [ "..." ],
+    "minimal_conflict_pairs": [ "..." ]
+  },
+  "diff": {
+    "base":   { "id": "an_e38b...", "ruleset_hash": "e38b...", "analyzer_version": "1.0.0" },
+    "target": { "id": null,        "ruleset_hash": "9f1c...", "analyzer_version": "1.0.0" },
+    "changes": [
+      {
+        "ip_version": 4,
+        "change_type": "permit_to_deny",
+        "from_action": "permit", "to_action": "deny",
+        "address_count": 256, "range_count": 1,
+        "cidrs": ["10.10.99.0/24"]
+      }
+    ],
+    "summary": { "...": "与 /diff 端点相同的分类计数..." }
+  }
+}
+```
+
+simulate 错误码：
+
+- 基准版本 ID 格式非法 → `400`；不存在 → `404`；
+- add 用了已存在的 ID、replace/remove 未命中、同一目标出现多次、replace 与 remove
+  撞同一 ID、或补丁删光了全部规则 →
+  `400 {"error": "invalid_simulation_patch", "errors": ["...全部原因..."]}`；
+- 补丁规则本身非法（CIDR 主机位非零等）→ `400 invalid_ruleset`；
+  字段类型/取值错误（未知 action、缺 `rule_id`、多余字段等）→ `422`。
+
 ### 错误处理
 
 - 非法 CIDR（语法错误、主机位非零、rule_id 重复等）→ `400`，形如
   `{"error": "invalid_ruleset", "detail": "rule #1: invalid CIDR '10.0.0.5/24' (...)"}`
+- simulate 补丁中存在非法操作（ID 未命中/重复、跨操作撞同一目标等）→
+  `400 {"error": "invalid_simulation_patch", "errors": [...]}`，整批拒绝
 - 字段类型/取值错误（未知 action、空规则列表、多余字段等）→ `422`（Pydantic 校验错误）
 - 版本不存在 → `404`
 
@@ -239,11 +331,13 @@ curl -s "http://localhost:8080/api/analyses/an_8914e028acea3413/diff/an_efdb05ad
 │   ├── __init__.py
 │   ├── analyzer.py     # 核心引擎：CIDR 解析、trie、覆盖与最小冲突对（纯函数，可独立使用）
 │   ├── diff.py         # 版本语义差异：生效动作分区叠加 + 相邻同类范围合并（纯函数，可独立使用）
+│   ├── simulate.py     # 变更预演：从已保存版本重建输入、整批校验并应用 add/replace/remove
 │   ├── schemas.py      # Pydantic v2 请求/响应模型
 │   ├── db.py           # SQLite 持久层（analyses / rules / findings 三表）
 │   └── main.py         # FastAPI 路由
-├── tests/test_api.py   # 端到端测试（pytest + TestClient）
-├── tests/test_diff.py  # 语义差异端点测试
+├── tests/test_api.py        # 端到端测试（pytest + TestClient）
+├── tests/test_diff.py       # 语义差异端点测试
+├── tests/test_simulate.py   # 规则变更预演端点测试
 ├── requirements.txt
 ├── Dockerfile          # 非 root 运行、内置 HEALTHCHECK、暴露 8080
 ├── docker-compose.yml  # 单命令启动 + 命名卷持久化
