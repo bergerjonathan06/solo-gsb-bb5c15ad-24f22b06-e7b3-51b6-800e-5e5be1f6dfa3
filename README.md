@@ -93,6 +93,7 @@ N 的实际覆盖碎片。
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
 | POST | `/api/analyze` | 分析规则集（默认保存；`save:false` 只算不存） |
+| POST | `/api/analyses/{id}/simulate` | 基于已保存版本预演 add/replace/remove 规则变更（**不落库**），返回新分析结果与语义差异 |
 | GET | `/api/analyses` | 列出已保存版本（`limit`/`offset` 分页） |
 | GET | `/api/analyses/{id}` | 取某个版本的完整分析结果 |
 | GET | `/api/analyses/{id}/rules` | 查询规则：`status=active/partial/shadowed`、`action=permit/deny`、`ip=4/6` |
@@ -175,6 +176,100 @@ curl -s "http://localhost:8080/api/analyses/an_e38b58f57faf2325/findings?behavio
 curl -sOJ "http://localhost:8080/api/analyses/an_e38b58f57faf2325/export.json"
 ```
 
+### 规则变更预演（simulate）
+
+在某个**已保存版本**之上预演一批规则变更，无需另存为新版本。服务端从该版本的保存结果
+**重建原始分析输入**，按 `rule_id` 定位并应用 `add` / `replace` / `remove` 三类操作，
+然后重新执行 LPM 分析，返回：
+
+- `simulated`：补丁后的**完整分析结果**（与 `/api/analyze` 同构），但 `id: null`、
+  `persisted: false`——**不会创建任何分析记录**，数据库中不新增 analyses/rules/findings 行；
+- `diff`：预演结果相对**基准版本**的最终生效动作语义差异（结构同
+  `/api/analyses/{base}/diff/{target}`，`target.id` 为 `null`）。
+
+批次契约（**任一操作非法则整批拒绝**，错误中 `issues` 一次性列出全部问题）：
+
+| 操作 | 请求体 | 定位要求 |
+| --- | --- | --- |
+| `add` | 完整新规则（`rule_id` 必填） | `rule_id` 必须是基准版本中**不存在的新 ID**；新规则按请求顺序追加在幸存规则之后（顺序仍参与同 CIDR 优先级裁决） |
+| `replace` | 完整替换规则（`rule_id` 必填） | `rule_id` 必须**命中基准版本**；整条规则就地替换、保留原位置，不允许改名 |
+| `remove` | `{"rule_id": "..."}` | `rule_id` 必须**命中基准版本** |
+
+- 每个 `rule_id` 在整批中**最多成为一个操作的目标**（同一列表重复、跨列表同时出现都拒绝）；
+- 补丁后规则集不能为空（不能删光所有规则）；
+- 新增/替换规则里的 CIDR、action 仍按既有规则校验，非法时返回与 `/api/analyze` 一致的
+  `400 invalid_ruleset`；字段层面错误（未知字段、缺 `rule_id`、未知 action 等）返回 `422`。
+
+删除或改写更具体的子网规则后，**祖先规则会在让出的范围上重新生效**：例如
+`permit 10.0.0.0/8 → deny 10.1.0.0/16 → permit 10.1.1.0/24` 中删掉 deny /16 后，
+permit /8 祖先重新转发 `10.1.0.0/16 − 10.1.1.0/24`（diff 中表现为一组
+`deny_to_permit` 的最小 CIDR），而 permit /24 孙子规则不受影响。
+
+```bash
+curl -s -X POST http://localhost:8080/api/analyses/an_e38b58f57faf2325/simulate \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "remove":  [{"rule_id": "r2"}],
+    "replace": [
+      {"rule_id": "r3", "cidr": "10.10.1.0/24", "action": "deny",
+       "priority": 900, "source_tag": "lab"}
+    ],
+    "add": [
+      {"rule_id": "r9", "cidr": "10.20.0.0/16", "action": "deny",
+       "priority": 400, "source_tag": "dc2"}
+    ]
+  }'
+```
+
+响应（节选）：
+
+```json
+{
+  "base": {"id": "an_e38b58f57faf2325", "ruleset_hash": "e38b58f5...", "analyzer_version": "1.0.0"},
+  "simulated": {
+    "analyzer_version": "1.0.0",
+    "ruleset_hash": "7c41...（预演输入的哈希，仅用于本次响应）",
+    "id": null,
+    "name": null,
+    "persisted": false,
+    "summary": {"rule_count": 3, "...": "..."},
+    "rules": ["...完整规则结果..."],
+    "findings": ["..."],
+    "minimal_conflict_pairs": ["..."]
+  },
+  "diff": {
+    "base":   {"id": "an_e38b58f57faf2325", "ruleset_hash": "e38b58f5...", "analyzer_version": "1.0.0"},
+    "target": {"id": null, "ruleset_hash": "7c41...", "analyzer_version": "1.0.0"},
+    "changes": [
+      {"ip_version": 4, "change_type": "deny_to_permit",
+       "from_action": "deny", "to_action": "permit",
+       "address_count": 65280, "range_count": 8,
+       "cidrs": ["10.10.0.0/24", "10.10.2.0/23", "..."]},
+      {"ip_version": 4, "change_type": "none_to_deny",
+       "from_action": null, "to_action": "deny",
+       "address_count": 65536, "range_count": 1, "cidrs": ["10.20.0.0/16"]}
+    ],
+    "summary": {"...": "与版本语义差异相同的分类计数..."}
+  }
+}
+```
+
+非法批次的 `400` 响应（示例：add 撞了已有 ID、remove 指向不存在的 ID）：
+
+```json
+{
+  "error": "invalid_simulation",
+  "detail": "add targets existing rule_id 'r1'; ...; remove targets unknown rule_id 'zz'; ...",
+  "issues": [
+    "add targets existing rule_id 'r1'; add may only introduce a new rule_id",
+    "remove targets unknown rule_id 'zz'; it must match a rule of the base version"
+  ]
+}
+```
+
+基准版本不存在 → `404`。预演不产生任何副作用，可安全重复调用；若补丁与基准完全等价
+（如用相同记录 replace），`diff.changes` 为空且 `ruleset_hash` 与基准一致。
+
 ### 版本语义差异（semantic diff）
 
 给定两个**已保存**版本 ID，逐地址比较它们的**最终生效动作**：地址落在某条 winner 规则的
@@ -226,6 +321,9 @@ curl -s "http://localhost:8080/api/analyses/an_8914e028acea3413/diff/an_efdb05ad
 
 - 非法 CIDR（语法错误、主机位非零、rule_id 重复等）→ `400`，形如
   `{"error": "invalid_ruleset", "detail": "rule #1: invalid CIDR '10.0.0.5/24' (...)"}`
+- 预演批次非法（add 撞已有 ID、replace/remove 未命中基准、同一目标出现多次、删光所有规则、
+  空批次）→ `400`，形如
+  `{"error": "invalid_simulation", "detail": "...", "issues": ["...全部问题..."]}`
 - 字段类型/取值错误（未知 action、空规则列表、多余字段等）→ `422`（Pydantic 校验错误）
 - 版本不存在 → `404`
 
@@ -239,11 +337,13 @@ curl -s "http://localhost:8080/api/analyses/an_8914e028acea3413/diff/an_efdb05ad
 │   ├── __init__.py
 │   ├── analyzer.py     # 核心引擎：CIDR 解析、trie、覆盖与最小冲突对（纯函数，可独立使用）
 │   ├── diff.py         # 版本语义差异：生效动作分区叠加 + 相邻同类范围合并（纯函数，可独立使用）
+│   ├── simulate.py     # 变更预演：从已保存版本重建输入 + add/replace/remove 批次校验与打补丁（纯函数）
 │   ├── schemas.py      # Pydantic v2 请求/响应模型
 │   ├── db.py           # SQLite 持久层（analyses / rules / findings 三表）
 │   └── main.py         # FastAPI 路由
-├── tests/test_api.py   # 端到端测试（pytest + TestClient）
-├── tests/test_diff.py  # 语义差异端点测试
+├── tests/test_api.py       # 端到端测试（pytest + TestClient）
+├── tests/test_diff.py      # 语义差异端点测试
+├── tests/test_simulate.py  # 规则变更预演端点测试
 ├── requirements.txt
 ├── Dockerfile          # 非 root 运行、内置 HEALTHCHECK、暴露 8080
 ├── docker-compose.yml  # 单命令启动 + 命名卷持久化

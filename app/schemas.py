@@ -46,6 +46,56 @@ class AnalyzeRequest(BaseModel):
     save: bool = Field(default=True, description="Persist this analysis as an immutable version")
 
 
+class RuleAdd(RuleIn):
+    """A brand-new rule for a simulation batch; the id must not exist yet."""
+
+    rule_id: str = Field(..., description="Unique id of the new rule; must not exist in the base version")
+
+
+class RuleReplace(RuleIn):
+    """Full replacement record of an existing rule (id must hit the base version)."""
+
+    rule_id: str = Field(..., description="rule_id of the base-version rule to replace")
+
+
+class RuleRemove(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    rule_id: str = Field(..., description="rule_id of the base-version rule to remove")
+
+    @field_validator("rule_id")
+    @classmethod
+    def _strip(cls, v: str) -> str:
+        v = v.strip()
+        if not v:
+            raise ValueError("must not be empty")
+        return v
+
+
+class SimulateRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    add: list[RuleAdd] = Field(
+        default_factory=list,
+        description="Rules to append; rule_ids must be new (no overlap with the base version)",
+    )
+    replace: list[RuleReplace] = Field(
+        default_factory=list,
+        description="Existing rules to rewrite in place; rule_ids must hit the base version",
+    )
+    remove: list[RuleRemove] = Field(
+        default_factory=list,
+        description="Existing rules to delete; rule_ids must hit the base version",
+    )
+
+    @field_validator("add", "replace", "remove", mode="before")
+    @classmethod
+    def _must_be_list(cls, v: Any) -> Any:
+        if not isinstance(v, list):
+            raise ValueError("must be a list of operations")
+        return v
+
+
 class ListAnalysesResponse(BaseModel):
     total: int
     analyses: list[dict[str, Any]]

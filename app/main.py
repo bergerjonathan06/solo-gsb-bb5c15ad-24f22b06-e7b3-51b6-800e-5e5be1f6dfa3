@@ -2,14 +2,15 @@
 
 Endpoints
 ---------
-POST   /api/analyze                    analyze a rule set (optionally persist)
-GET    /api/analyses                   list saved analysis versions
-GET    /api/analyses/{id}              fetch one version with the full result
-GET    /api/analyses/{id}/rules        query rules (filters: status/action/ip_version)
-GET    /api/analyses/{id}/findings     query findings (filters: severity/behavioral_only)
-GET    /api/analyses/{id}/export.json  download the result as a JSON file
-GET    /api/analyses/{id}/diff/{oid}   effective-action semantic diff of two versions
-GET    /health                         liveness probe
+POST   /api/analyze                          analyze a rule set (optionally persist)
+POST   /api/analyses/{id}/simulate           preview add/replace/remove changes without saving
+GET    /api/analyses                         list saved analysis versions
+GET    /api/analyses/{id}                    fetch one version with the full result
+GET    /api/analyses/{id}/rules              query rules (filters: status/action/ip_version)
+GET    /api/analyses/{id}/findings           query findings (filters: severity/behavioral_only)
+GET    /api/analyses/{id}/export.json        download the result as a JSON file
+GET    /api/analyses/{id}/diff/{oid}         effective-action semantic diff of two versions
+GET    /health                               liveness probe
 """
 
 from __future__ import annotations
@@ -26,7 +27,8 @@ from . import __version__
 from .analyzer import ANALYZER_VERSION, ValidationError, analyze_rules
 from . import db
 from .diff import ANALYSIS_ID_RE, diff_analyses
-from .schemas import AnalyzeRequest
+from .schemas import AnalyzeRequest, SimulateRequest
+from .simulate import PatchError, apply_patch, rebuild_input_rules
 
 
 @asynccontextmanager
@@ -51,6 +53,15 @@ app = FastAPI(
 @app.exception_handler(ValidationError)
 async def _validation_error_handler(_request, exc: ValidationError):
     return JSONResponse(status_code=400, content={"error": "invalid_ruleset", "detail": str(exc)})
+
+
+@app.exception_handler(PatchError)
+async def _patch_error_handler(_request, exc: PatchError):
+    # The whole batch is rejected; every offending target is reported at once.
+    return JSONResponse(
+        status_code=400,
+        content={"error": "invalid_simulation", "detail": str(exc), "issues": exc.issues},
+    )
 
 
 def _make_id(ruleset_hash: str) -> str:
@@ -112,6 +123,46 @@ def get_analysis(analysis_id: str) -> dict[str, Any]:
     if result is None:
         raise HTTPException(status_code=404, detail=f"analysis '{analysis_id}' not found")
     return result
+
+
+@app.post("/api/analyses/{analysis_id}/simulate", status_code=200)
+def simulate_changes(analysis_id: str, req: SimulateRequest) -> dict[str, Any]:
+    """Preview a batch of ``add`` / ``replace`` / ``remove`` rule changes.
+
+    The analyzer input is rebuilt from the saved version, the validated patch
+    is applied, and the LPM analysis is re-run.  Nothing is persisted: the
+    response carries the unsaved preview plus its final effective-action
+    semantic diff against the base version.
+    """
+    base = db.get_analysis(analysis_id)
+    if base is None:
+        raise HTTPException(status_code=404, detail=f"analysis '{analysis_id}' not found")
+
+    add_rules = [r.model_dump() for r in req.add]
+    replace_rules = [r.model_dump() for r in req.replace]
+    remove_rules = [r.model_dump() for r in req.remove]
+
+    base_input = rebuild_input_rules(base)
+    patched_input = apply_patch(base_input, add_rules, replace_rules, remove_rules)
+
+    # Invalid CIDRs/actions inside replacement or added rules surface as the
+    # same 400 invalid_ruleset error as POST /api/analyze.
+    simulated = analyze_rules(patched_input)
+    simulated["id"] = None
+    simulated["name"] = None
+    simulated["created_at"] = db.utc_now_iso()
+    simulated["persisted"] = False
+
+    diff = diff_analyses(base, simulated)
+    return {
+        "base": {
+            "id": analysis_id,
+            "ruleset_hash": base.get("ruleset_hash"),
+            "analyzer_version": base.get("analyzer_version"),
+        },
+        "simulated": simulated,
+        "diff": diff,
+    }
 
 
 @app.get("/api/analyses/{analysis_id}/rules")
